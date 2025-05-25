@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from dataset import VideoAnomalyDataset
 from model import GRUAnomalyDetector
@@ -42,11 +43,12 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.BCELoss()
 
-    # Training loop
+    # Training loop with tqdm
     for epoch in range(1, args.epochs + 1):
         model.train()
         total_loss = 0.0
-        for seqs, labels in loader:
+        pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", unit="batch")
+        for seqs, labels in pbar:
             seqs   = seqs.to(device)
             labels = labels.to(device)
             probs  = model(seqs)
@@ -54,8 +56,12 @@ def main():
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
             total_loss += loss.item()
-        print(f"Epoch {epoch}/{args.epochs} — Loss: {total_loss/len(loader):.4f}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        avg_loss = total_loss / len(loader)
+        print(f"Epoch {epoch}/{args.epochs} — Avg Loss: {avg_loss:.4f}")
 
     # Save
     torch.save(model.state_dict(), 'anomaly_detector.pth')
