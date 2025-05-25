@@ -33,9 +33,9 @@ def main():
     loader = DataLoader(
         dataset,
         batch_size=args.bs,
+        num_workers=0,
         shuffle=False,
-        drop_last=True,
-        num_workers=0
+        drop_last=True
     )
 
     # Model, Optimizer, Loss
@@ -43,27 +43,33 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.BCELoss()
 
-    # Training loop with tqdm
+    # Training loop with manual batch counting
     for epoch in range(1, args.epochs + 1):
         model.train()
         total_loss = 0.0
+        num_batches = 0
+
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", unit="batch")
         for seqs, labels in pbar:
             seqs   = seqs.to(device)
             labels = labels.to(device)
             probs  = model(seqs)
             loss   = criterion(probs, labels)
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
+            num_batches += 1
+
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        avg_loss = total_loss / len(loader)
+        # 배치 수로 평균 손실 계산
+        avg_loss = total_loss / num_batches if num_batches > 0 else float('nan')
         print(f"Epoch {epoch}/{args.epochs} — Avg Loss: {avg_loss:.4f}")
 
-    # Save
+    # Save model
     torch.save(model.state_dict(), 'anomaly_detector.pth')
 
 if __name__ == '__main__':
