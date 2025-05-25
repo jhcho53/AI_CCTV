@@ -5,7 +5,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset import VideoAnomalyDataset
+from dataset import VideoAnomalyIterableDataset
 from model import GRUAnomalyDetector
 
 def parse_args():
@@ -25,7 +25,7 @@ def main():
     device = torch.device('cuda' if args.cuda and torch.cuda.is_available() else 'cpu')
 
     # Dataset & DataLoader
-    dataset = VideoAnomalyDataset(
+    dataset = VideoAnomalyIterableDataset(
         label_dir=args.label_dir,
         seq_len=args.seq,
         fps=args.fps
@@ -33,7 +33,7 @@ def main():
     loader = DataLoader(
         dataset,
         batch_size=args.bs,
-        shuffle=True,
+        shuffle=False,
         drop_last=True,
         num_workers=0
     )
