@@ -6,7 +6,7 @@ from torchvision.models import mobilenet_v2
 
 # 시퀀스 길이, 이미지 크기
 SEQ_LEN    = 8
-H, W       = 256, 256   # 변경: 256×256 입력
+H, W       = 256, 256  
 FEAT_DIM   = 64
 HIDDEN_DIM = 128
 

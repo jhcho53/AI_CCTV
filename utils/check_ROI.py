@@ -2,7 +2,7 @@ import cv2
 
 # 1) 입력 비디오 경로와 ROI (x1, y1, x2, y2) 지정
 video_path = '/home/vip1/Desktop/SSDC/neubility/gd/BTS_graduate_project/Training/video/E01_001.mp4'
-roi = (1150, 300, 1600, 700)  # 예시: (좌상단 x, y, 우하단 x, y)
+roi = (1150, 300, 1600, 700)
 
 # 2) 비디오 열고 첫 프레임 읽기
 cap = cv2.VideoCapture(video_path)
