@@ -17,7 +17,5 @@ x1, y1, x2, y2 = roi
 boxed = frame.copy()
 cv2.rectangle(boxed, (x1, y1), (x2, y2), color=(0, 0, 255), thickness=3)
 
-# 4) 시각화 (윈도우)
-
-# 5) 파일로 저장하고 싶다면:
+# 4) 파일로 저장
 cv2.imwrite('first_frame_with_roi.png', boxed)

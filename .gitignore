@@ -53,6 +53,7 @@ coverage.xml
 # PyTorch checkpoints, weights, logs
 *.pt
 *.pth
+*.mp4
 checkpoints/
 logs/
 
@@ -62,6 +63,8 @@ datasets/
 output/
 results/
 Training/
+video/
+label/
 
 # VS Code
 .vscode/
