@@ -32,3 +32,15 @@ BTS_graduate_project/
    git clone https://github.com/jhcho53/BTS_graduate_project.git
    cd BTS_graduate_project
 
+2. Python 가상환경 생성  
+   ```bash
+   conda env create -f environment.yml
+   conda activate bts
+
+3. 모델 학습
+   ```bash
+   python train.py \
+  --data_root $BTS_DATA_ROOT \
+  --epochs 50 \
+  --batch_size 16 \
+  --cuda
