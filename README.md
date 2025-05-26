@@ -25,12 +25,11 @@
 ```plaintext
 BTS_graduate_project/
 ├── model/
-│   ├── __init__.py
-│   ├── gru_model.py
-│   └── transformer_model.py
+│   └── model.py
 ├── utils/
-│   ├── logger.py
-│   └── metrics.py
+│   ├── check_ROI.py
+│   ├── inf_utils.py
+|   └── video_vlm.py
 ├── dataset.py
 ├── train.py             # 전체 데이터셋 기반 멀티-GPU 학습
 ├── single_train.py      # 단일 비디오 학습 스크립트
@@ -38,3 +37,12 @@ BTS_graduate_project/
 ├── requirements.txt     # 의존성 목록
 ├── .gitignore
 └── README.md
+```
+
+## 설치 및 환경 설정
+
+1. 저장소 클론  
+   ```bash
+   git clone https://github.com/jhcho53/BTS_graduate_project.git
+   cd BTS_graduate_project
+
