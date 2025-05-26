@@ -21,18 +21,20 @@
 ---
 
 ## 디렉토리 구조
+
+```plaintext
 BTS_graduate_project/
 ├── model/
-│ ├── init.py
-│ ├── gru_model.py
-│ └── transformer_model.py
+│   ├── __init__.py
+│   ├── gru_model.py
+│   └── transformer_model.py
 ├── utils/
-│ ├── logger.py
-│ └── metrics.py
+│   ├── logger.py
+│   └── metrics.py
 ├── dataset.py
-├── train.py # 전체 데이터셋 기반 멀티-GPU 학습
-├── single_train.py # 단일 비디오 학습 스크립트
-├── inference.py # 이상 탐지 추론 스크립트
-├── requirements.txt # 의존성 목록
+├── train.py             # 전체 데이터셋 기반 멀티-GPU 학습
+├── single_train.py      # 단일 비디오 학습 스크립트
+├── inference.py         # 이상 탐지 추론 스크립트
+├── requirements.txt     # 의존성 목록
 ├── .gitignore
 └── README.md
