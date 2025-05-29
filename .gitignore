@@ -61,11 +61,11 @@ logs/
 data/
 datasets/
 output/
-results/
+Results/
 Training/
 video/
 label/
-
+eval/
 # VS Code
 .vscode/
 
