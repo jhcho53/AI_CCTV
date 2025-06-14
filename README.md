@@ -37,14 +37,18 @@ BTS_graduate_project/
    conda env create -f environment.yml
    conda activate bts
 
-3. 모델 학습
+3. Train model
    ```bash
    python train.py \
    --data_root $BTS_DATA_ROOT \
    --epochs 50 \
    --batch_size 16 \
    --cuda
-4. 모델 평가
-   '''bash
+4. Evaluate model
+   ```bash
    python eval.py
+5. Inference model
+   ```bash
+   python inference.py --video $Video_Root \
+   --model $Model_Root\
    
