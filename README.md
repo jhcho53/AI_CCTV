@@ -5,7 +5,7 @@ This repository implements a deep learning pipeline for **video-based anomaly de
 
 ## Full Pipeline
 
-![Pipeline Overview](images/Pipeline.png)
+![Pipeline Overview](img/Pipeline.png)
 
 ### Pipeline Description
 
@@ -30,7 +30,7 @@ This repository implements a deep learning pipeline for **video-based anomaly de
 
 ## Detector Structure
 
-![Detector Architecture](images/Detector.png)
+![Detector Architecture](img/Detector.png)
 
 ### Detector Module
 
