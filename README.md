@@ -64,6 +64,9 @@ BTS_graduate_project/
 ├── .gitignore
 └── README.md
 ```
+## Prepare Dataset
+
+You can download the dataset from AIHUB: [AIHUB Anomaly Detection Dataset](https://www.aihub.or.kr/aihubdata/data/view.do?currMenu=115&topMenu=100&dataSetSn=71850)
 
 ## Installation & Setup
 
