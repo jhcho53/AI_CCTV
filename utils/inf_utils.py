@@ -3,6 +3,7 @@ import torch
 import numpy as np
 from model.model import GRUAnomalyDetector
 from utils.video_vlm import run_video_inference
+import time
 
 def load_model(model_path, device=None):
     """
@@ -83,6 +84,8 @@ def save_cropped_segments(
 
     out_paths = []
     for idx, (s,e) in enumerate(segments):
+        start_time = s / fps
+        end_time   = e / fps
         out_path = output_pattern.format(idx=idx)
         writer = cv2.VideoWriter(out_path, fourcc, fps, (w,h))
         cap.set(cv2.CAP_PROP_POS_FRAMES, s)
@@ -94,7 +97,7 @@ def save_cropped_segments(
         writer.release()
         out_paths.append(out_path)
         print(f'Saved {out_path} [{s}–{e}]')
-
+        print(f'Saved {out_path} [{s}–{e}] ({start_time:.2f}s–{end_time:.2f}s)')
     cap.release()
     return out_paths
 
