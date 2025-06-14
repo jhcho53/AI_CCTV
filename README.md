@@ -44,3 +44,7 @@ BTS_graduate_project/
    --epochs 50 \
    --batch_size 16 \
    --cuda
+4. 모델 평가
+   '''bash
+   python eval.py
+   
