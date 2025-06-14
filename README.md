@@ -4,6 +4,22 @@
 본 프로젝트는 **영상 기반 이상 행동(Anomaly) 탐지**를 목적으로 한 딥러닝 파이프라인을 구현한 리포지터리입니다.  
 `dataset.py`를 통해 데이터셋을 구성하고, `model/` 디렉토리 내 다양한 모델을 정의하여 `train.py`와 `sigle_train.py`로 학습을 수행하며, `inference.py`로 실시간 또는 배치 추론을 지원합니다.
 
+## Detector Structure
+![Detector Architecture](img/Detector.png)
+
+### Detector
+
+Detector 모듈은 크게 3단계로 구성됩니다:
+
+1. **Encoder**  
+   연속된 프레임들의 공간적 특징을 추출하는 CNN 기반 백본(예: ResNet-50)으로, 프레임별 임베딩 벡터를 생성합니다.
+
+2. **GRU**  
+   시퀀스별 임베딩을 입력으로 받아, 시간적 연속성을 모델링하는 Gated Recurrent Unit 으로 프레임 간의 동적 변화를 학습합니다.
+
+3. **MLP**  
+   GRU로부터 나온 최종 은닉 상태를 입력으로 받아 **Anomaly Score**를 회귀적으로 예측하는 다층 퍼셉트론입니다.
+
 ---
 
 ## 디렉토리 구조
