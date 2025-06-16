@@ -50,16 +50,16 @@ The Detector consists of three main stages:
 
 ```plaintext
 BTS_graduate_project/
-├── bts/                 # Applicataion
+├── bts/                 # Application
 ├── model/
 │   └── model.py
 ├── utils/
-    ├── internvl_chat    # InternVL Learning with LoRA
+│   ├── internvl_chat    # InternVL Learning with LoRA
 │   ├── check_ROI.py
 │   ├── inf_utils.py
 │   ├── video_vlm.py
-    ├── annotate_ROI.py
-    └── autolabeling.py
+│   ├── annotate_ROI.py
+│   └── autolabeling.py
 ├── dataset.py
 ├── train.py             # Multi-GPU training on the full dataset
 ├── single_train.py      # Single-video training script
