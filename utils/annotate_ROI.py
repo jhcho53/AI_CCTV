@@ -4,8 +4,8 @@ import json
 
 def add_roi_to_jsons(label_dir, default_roi=(1200, 380, 1700, 850)):
     """
-    label_dir 내 모든 JSON 파일을 열어 annotations['roi'] 필드를 추가합니다.
-    이미 'roi'가 있으면 덮어쓰며, 없으면 새로 삽입합니다.
+    label_dir 내 모든 JSON 파일을 열어 annotations['roi'] 필드를 추가
+    이미 'roi'가 있으면 덮어쓰며, 없으면 새로 삽입
     
     Args:
         label_dir (str): JSON 파일들이 위치한 디렉토리 경로
@@ -32,6 +32,4 @@ def add_roi_to_jsons(label_dir, default_roi=(1200, 380, 1700, 850)):
 
 if __name__ == "__main__":
     label_dir = "/home/jaehyeon/trash"  # JSON들이 들어있는 디렉토리
-    # 기본 ROI 대신 파일별로 다른 값을 쓰고 싶다면, 위 함수 호출 전에
-    # 파일명에 따라 ROI 값을 매핑해 두고 default_roi 대신 매핑값을 넣어주면 됩니다.
     add_roi_to_jsons(label_dir, default_roi=(860, 170, 1200, 450))

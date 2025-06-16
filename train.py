@@ -16,7 +16,7 @@ class BalancedBatchSampler(Sampler):
     매 배치마다 정상/이상 샘플을 반반씩 뽑는 Sampler
     """
     def __init__(self, labels, batch_size):
-        assert batch_size % 2 == 0, "batch_size는 짝수여야 합니다"
+        assert batch_size % 2 == 0, 
         self.batch_size  = batch_size
         self.half        = batch_size // 2
         self.pos_indices = [i for i, l in enumerate(labels) if l == 1.0]
@@ -108,11 +108,11 @@ def main():
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         avg_loss = total_loss / len(loader)
-        print(f"▶️ Epoch {epoch} Avg Loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch} Avg Loss: {avg_loss:.4f}")
 
         ckpt = f"anomaly_multi_balanced_epoch{epoch}.pth"
         torch.save(model.state_dict(), ckpt)
-        print(f"Saved 👉 {ckpt}")
+        print(f"Saved {ckpt}")
 
 if __name__ == '__main__':
     main()

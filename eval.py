@@ -83,8 +83,6 @@ for ann_path in json_paths:
     f1_list.append(f1)
     auc_list.append(roc_auc)
 
-    # (기존) JSON, bar chart 저장 생략...
-
 # ────────────────────────────────────────────────────────────────────────────
 # 폴더 전체 평균 메트릭 계산
 metrics_mean = {

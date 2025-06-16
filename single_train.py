@@ -118,9 +118,9 @@ for epoch in range(1, EPOCHS + 1):
         pbar.set_postfix(loss=f"{loss.item():.4f}")
 
     avg_loss = total_loss / len(loader)
-    print(f"▶️ Epoch {epoch} Avg Loss: {avg_loss:.4f}")
+    print(f"Epoch {epoch} Avg Loss: {avg_loss:.4f}")
     # 7) 모델 저장
     torch.save(model.state_dict(), 'anomaly_single_balanced.pth')
-    print('Saved 👉 anomaly_single_balanced.pth')
+    print('Saved anomaly_single_balanced.pth')
 
 
