@@ -68,6 +68,26 @@ BTS_graduate_project/
 
 You can download the dataset from AIHUB: [AIHUB Anomaly Detection Dataset](https://www.aihub.or.kr/aihubdata/data/view.do?currMenu=115&topMenu=100&dataSetSn=71850)
 
+## Jetson Container Setup
+
+To run this project on NVIDIA Jetson devices, pull and launch NVIDIA’s official PyTorch container:
+
+```bash
+# 1) Log in to NVIDIA GPU Cloud (if required)
+docker login nvcr.io
+
+# 2) Pull the Jetson PyTorch container
+docker pull nvcr.io/nvidia/l4t-pytorch:r32.7.1-pth1.10-py3
+
+# 3) Run the container with GPU and volume mounts
+docker run --runtime nvidia \
+  --network host \
+  -v $(pwd):/workspace \
+  -w /workspace \
+  -it nvcr.io/nvidia/l4t-pytorch:r32.7.1-pth1.10-py3 \
+  /bin/bash
+```
+
 ## Installation & Setup
 
 1. Clone the repository
