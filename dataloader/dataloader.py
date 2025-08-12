@@ -6,7 +6,7 @@ class BalancedBatchSampler(Sampler):
     매 배치마다 정상/이상 샘플을 반반씩 뽑는 Sampler
     """
     def __init__(self, labels, batch_size):
-        assert batch_size % 2 == 0, 
+        assert batch_size % 2 == 0 
         self.batch_size  = batch_size
         self.half        = batch_size // 2
         self.pos_indices = [i for i, l in enumerate(labels) if l == 1.0]

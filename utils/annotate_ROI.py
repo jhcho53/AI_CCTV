@@ -1,8 +1,9 @@
 import os
 import glob
 import json
+roi = (900, 0, 1300, 300)
 
-def add_roi_to_jsons(label_dir, default_roi=(1200, 380, 1700, 850)):
+def add_roi_to_jsons(label_dir, default_roi=(900, 0, 1300, 300)):
     """
     label_dir 내 모든 JSON 파일을 열어 annotations['roi'] 필드를 추가
     이미 'roi'가 있으면 덮어쓰며, 없으면 새로 삽입
@@ -31,5 +32,5 @@ def add_roi_to_jsons(label_dir, default_roi=(1200, 380, 1700, 850)):
         print(f"Updated ROI in: {os.path.basename(path)}")
 
 if __name__ == "__main__":
-    label_dir = "/home/jaehyeon/trash"  # JSON들이 들어있는 디렉토리
+    label_dir = "/home/jaehyeon/Desktop/졸작/BTS_graduate_project/Dataset/Label/trash"  # JSON들이 들어있는 디렉토리
     add_roi_to_jsons(label_dir, default_roi=(860, 170, 1200, 450))

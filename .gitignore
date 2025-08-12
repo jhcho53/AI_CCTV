@@ -60,6 +60,7 @@ logs/
 # Data files (원천／중간／결과 데이터)
 data/
 datasets/
+Dataset/
 output/
 Results/
 Training/
