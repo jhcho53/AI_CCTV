@@ -1,7 +1,7 @@
 import os
 import glob
 import json
-roi = (900, 0, 1300, 300)
+roi = (1050, 100, 1300, 350)
 
 def add_roi_to_jsons(label_dir, default_roi=(900, 0, 1300, 300)):
     """
@@ -33,4 +33,4 @@ def add_roi_to_jsons(label_dir, default_roi=(900, 0, 1300, 300)):
 
 if __name__ == "__main__":
     label_dir = "/home/jaehyeon/Desktop/졸작/BTS_graduate_project/Dataset/Label/trash"  # JSON들이 들어있는 디렉토리
-    add_roi_to_jsons(label_dir, default_roi=(860, 170, 1200, 450))
+    add_roi_to_jsons(label_dir, default_roi=(550, 100, 800, 250))

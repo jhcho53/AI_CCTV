@@ -2,8 +2,8 @@ import cv2
 import matplotlib.pyplot as plt
 
 # 1) 입력 비디오 경로와 ROI (x1, y1, x2, y2) 지정
-video_path = '/home/jaehyeon/Desktop/졸작/BTS_graduate_project/Dataset/Video/E02_014.mp4'
-roi = (900, 0, 1300, 300)
+video_path = '/home/jaehyeon/Desktop/졸작/BTS_graduate_project/Dataset/Video/E02_001.mp4'
+roi = (550, 100, 800, 250)
 
 # 2) 비디오 열고 첫 프레임 읽기
 cap = cv2.VideoCapture(video_path)

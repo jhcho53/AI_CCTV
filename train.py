@@ -21,8 +21,9 @@ def parse_args():
     p.add_argument('--epochs', type=int, default=5, help="학습 에폭 수")
     p.add_argument('--lr', type=float, default=1e-3, help="학습률")
     p.add_argument('--default_roi', type=int, nargs=4,
-                   default=[1150,300,1600,700],
-                   help="JSON에 ROI 없을 때 사용할 기본 ROI: x1 y1 x2 y2")
+                   default=[0, 0, 999999, 999999],
+                   help="JSON에 ROI 없을 때 사용할 기본 ROI(전체 이미지): x1 y1 x2 y2")
+
     p.add_argument('--num_workers', type=int, default=4, help="DataLoader 워커 수")
     p.add_argument('--pin_memory', action='store_true', help="pin_memory 사용 여부")
     p.add_argument('--use_cuda', action='store_true', help="CUDA 사용 여부")
@@ -38,7 +39,7 @@ def main():
     dataset = MultiVideoAnomalyDataset(
         label_dir   = args.label_dir,
         seq_len     = args.seq_len,
-        default_roi = tuple(args.default_roi),
+        default_roi = tuple(args.default_roi),   # (0,0,999999,999999) -> 전체 프레임
         transform   = None
     )
     print(f"총 시퀀스 샘플: {len(dataset)}")
