@@ -7,6 +7,8 @@ from PIL import Image
 from torchvision.transforms.functional import InterpolationMode
 from transformers import AutoModel, AutoTokenizer, AutoConfig
 
+from typing import List, Tuple, Optional
+
 # ---------- Optional backends ----------
 # Try decord first (best for random access). If unavailable, fall back to OpenCV or PyAV.
 try:
@@ -57,6 +59,13 @@ def find_closest_aspect_ratio(ar, target_ratios, w, h, image_size):
 
 
 def dynamic_preprocess(image: Image.Image, min_num=1, max_num=12, image_size=448, use_thumbnail=False):
+    """
+    InternVL 비전 타워에서 사용하는 멀티-타일 전처리.
+    1) 입력 이미지를 image_size 그리드에 맞춰 리사이즈 후
+    2) i x j 타일로 분할 (최대 max_num 타일)
+    3) 필요시 썸네일 1장 추가
+    반환: PIL.Image 리스트(타일들)
+    """
     w, h = image.size
     ar = w / h
     ratios = sorted(
@@ -326,7 +335,9 @@ def load_video(video_path, bound=None, input_size=448, max_num=1, num_segments=3
         )
 
     # Preprocess into tiles/patches
+    transform = build_transform(input_size)
     pixel_vals = []
+    patch_counts = []
     for arr in frames_np:
         img = Image.fromarray(arr).convert('RGB')
         tiles = dynamic_preprocess(img, image_size=input_size, use_thumbnail=True, max_num=max_num)
@@ -372,3 +383,103 @@ def run_video_inference(
     )
 
     return [(q1, resp1), (q2, resp2)]
+
+
+# ======================= NEW: frames_direct support =========================
+def _uniform_indices_from_length(total: int, num_segments: int) -> List[int]:
+    """프레임 리스트 길이(total)에서 num_segments개를 균등 샘플링한 인덱스 리스트 반환."""
+    if total <= 0:
+        return []
+    num_segments = max(1, int(num_segments))
+    if num_segments == 1:
+        return [total - 1]  # 마지막 프레임 하나(게이팅에 유리)
+    idxs = np.linspace(0, total - 1, num_segments).astype(int).tolist()
+    return idxs
+
+
+def _bgr_ndarray_to_pil_rgb(arr: np.ndarray) -> Image.Image:
+    """np.ndarray(BGR, HxWx3) -> PIL RGB"""
+    if arr is None:
+        raise ValueError("Empty frame array.")
+    if _HAVE_CV2:
+        # BGR -> RGB via cv2
+        arr_rgb = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+    else:
+        # numpy channel reverse
+        arr_rgb = arr[:, :, ::-1].copy()
+    return Image.fromarray(arr_rgb)
+
+
+def _frames_to_pixel_values(
+    frames_bgr: List[np.ndarray],
+    input_size: int = 448,
+    max_num: int = 1
+) -> Tuple[torch.Tensor, List[int]]:
+    """
+    프레임 리스트(BGR) -> InternVL 전처리 (타일링) -> pixel_values 텐서 + 각 프레임별 타일 수 리스트
+    pixel_values: [sum_patches, 3, H, W] (float32, 이후 bfloat16 cast)
+    """
+    transform = build_transform(input_size)
+    pixel_vals = []
+    patch_counts: List[int] = []
+    for bgr in frames_bgr:
+        img = _bgr_ndarray_to_pil_rgb(bgr)
+        tiles = dynamic_preprocess(img, image_size=input_size, use_thumbnail=True, max_num=max_num)
+        tv = torch.stack([transform(t) for t in tiles])  # [P,3,H,W]
+        patch_counts.append(tv.shape[0])
+        pixel_vals.append(tv)
+    if not pixel_vals:
+        raise ValueError("No frames after preprocessing.")
+    return torch.cat(pixel_vals, dim=0), patch_counts
+
+
+def run_frames_inference(
+    model,
+    tokenizer,
+    frames_bgr: List[np.ndarray],
+    generation_config,
+    num_segments: int = 4,
+    max_num: int = 1,
+    input_size: int = 448
+) -> List[Tuple[str, str]]:
+    """
+    InternVL 계열(예: InternVL3-1B) 프레임 직접 추론.
+    - frames_bgr: list[np.ndarray], BGR, HxWx3
+    - num_segments: 전체 프레임 중 균등 샘플 개수(1이면 마지막 프레임만 사용)
+    - max_num: 프레임당 타일(패치) 최대 개수(InternVL 타일링)
+    - 반환: [(질문, 답변), ...]
+    """
+    if not isinstance(frames_bgr, list) or len(frames_bgr) == 0:
+        return [("Did someone fallen?", ""), ("Describe this scene.", "")]
+
+    # 1) 프레임 균등 샘플링
+    idxs = _uniform_indices_from_length(len(frames_bgr), num_segments)
+    sampled = [frames_bgr[i] for i in idxs]
+
+    # 2) 전처리(타일링) -> pixel_values + 각 프레임별 타일 수
+    pv, patch_list = _frames_to_pixel_values(sampled, input_size=input_size, max_num=max_num)
+
+    # 3) 디바이스/타입
+    device = next(model.parameters()).device
+    pv = pv.to(torch.bfloat16).to(device)
+
+    # 4) 프롬프트: Frame1:<image> ... 구성
+    prefix = prepare_video_prompts(patch_list)
+
+    # 첫 질문
+    q1 = prefix + 'Did someone fallen?'
+    resp1, hist = model.chat(
+        tokenizer, pv, q1, generation_config,
+        num_patches_list=patch_list, history=None, return_history=True
+    )
+
+    # 후속 질문
+    q2 = 'Describe this scene.'
+    resp2, hist2 = model.chat(
+        tokenizer, pv, q2, generation_config,
+        num_patches_list=patch_list, history=hist, return_history=True
+    )
+
+    return [(q1, resp1), (q2, resp2)]
+# ===========================================================================
+
