@@ -60,33 +60,29 @@ def now_str():
 def text_norm(s: str) -> str:
     return re.sub(r'[\W_]+', ' ', (s or '')).strip().lower()
 
-YES_TOKENS = {"yes", "y", "true", "1", "yeah", "yep", "affirmative"}
 NO_TOKENS  = {"no", "n", "false", "0", "nope", "nah"}
+
+YES_TOKENS = {"yes", "y", "true", "1", "yeah", "yep", "affirmative"}
+
+def text_norm(s: str) -> str:
+    import re
+    return re.sub(r'[\W_]+', ' ', (s or '')).strip().lower()
 
 def is_yes(s: str) -> bool:
     t = text_norm(s)
     return t in YES_TOKENS or t.startswith("yes")
 
-def is_no(s: str) -> bool:
-    t = text_norm(s)
-    return t in NO_TOKENS or t.startswith("no")
-
 def is_fall_positive(qa_pairs):
     """
-    규칙:
-    1) 첫 Q/A가 'Did someone fallen?' 계열이면 그 답변이 Yes일 때만 True.
-    2) 첫 질문이 다른 내용이면 저장하지 않음(False). (요구사항에 맞춤)
+    변경된 규칙:
+    - Q/A 목록의 첫 번째 답변이 'Yes(계열)'이면 Positive
+    - 질문 내용(키워드)은 더 이상 사용하지 않음
     """
     if not qa_pairs:
         return False
-    q0, a0 = qa_pairs[0]
-    qn = text_norm(q0)
-    # 'did someone fall', 'fallen', 'fall down' 등을 포함하는지 확인
-    contains_fall = ("fall" in qn) or ("fallen" in qn) or ("fall down" in qn)
-    if not contains_fall:
-        return False
-    # 첫 답변이 Yes여야만 저장
-    return is_yes(a0)
+    # qa_pairs: List[Tuple[question, answer]]
+    first_answer = qa_pairs[0][1]
+    return is_yes(first_answer)
 
 
 def unique_path(base_dir: str, base_name: str) -> str:

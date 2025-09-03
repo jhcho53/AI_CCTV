@@ -1,298 +1,470 @@
-import os
-import os.path as osp
-import glob
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Batch VLM Evaluation over a directory of short video sequences (OpenCV-only, no ROS).
+- Hard-disable TensorFlow import by default (robust stub with __spec__/__path__)
+  to avoid CUDA/XLA conflicts. Can be disabled with ALLOW_TF_IMPORT=1.
+- Avoid decord/pyav; sample frames using OpenCV only.
+- Always use frames_direct (run_frames_inference) to feed frames directly to InternVL.
+- 2-stage gating:
+  1) Fast Yes/No with minimal tokens/frames
+  2) If Yes -> concise description + optional saving (copy or skim) + JSONL logging
+
+Requires:
+  - utils/video_vlm.py with:
+      init_model(...)
+      run_frames_inference(...)   # must exist
+"""
+
+# ---------- robust TensorFlow stub (before ANY other import) ----------
+import os, sys, types, importlib.machinery
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
+
+def _stub_package(name: str):
+    """Create a package-like stub with __spec__ and __path__ so find_spec() doesn't error."""
+    if name in sys.modules:
+        m = sys.modules[name]
+        if getattr(m, "__spec__", None) is None:
+            m.__spec__ = importlib.machinery.ModuleSpec(name, loader=None, is_package=True)
+        if not hasattr(m, "__path__"):
+            m.__path__ = []  # type: ignore
+        return
+    m = types.ModuleType(name)
+    m.__spec__ = importlib.machinery.ModuleSpec(name, loader=None, is_package=True)
+    m.__path__ = []  # type: ignore
+    sys.modules[name] = m
+
+# By default, block TF to avoid CUDA/XLA conflicts. Can be disabled via env.
+if os.environ.get("ALLOW_TF_IMPORT", "0").lower() not in ("1", "true", "yes", "y"):
+    for mod in [
+        "tensorflow",
+        "tensorflow.python",
+        "tensorflow.compat",
+        "tensorflow.compat.v1",
+        "tensorflow.compat.v2",
+        "tf_keras",
+        "keras",  # some stacks try keras first
+    ]:
+        _stub_package(mod)
+# ----------------------------------------------------------------------
+
+import cv2
 import json
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-import matplotlib.pyplot as plt
+import time
+import glob
+import shutil
+import argparse
 import numpy as np
-from collections import defaultdict
-import csv
+from typing import List, Tuple, Optional
+from datetime import datetime
 
-from dataset import MultiVideoAnomalyDataset
-from model.model import GRUAnomalyDetector
-
-from sklearn.metrics import (
-    precision_score,
-    recall_score,
-    f1_score,
-    roc_auc_score,
-)
-
-# ────────────────────────────────────────────────────────────────────────────
-# 설정
-LABEL_DIR   = '/home/jaehyeon/Desktop/졸작/BTS_graduate_project/eval'
-FPS         = 30
-SEQ_LEN     = 8
-BATCH_SIZE  = 4
-MODEL_PATH  = 'anomaly_multi_balanced_epoch24.pth'
-DEVICE      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-# ────────────────────────────────────────────────────────────────────────────
-# 결과 저장 폴더
-RESULT_DIR = 'Results'
-os.makedirs(RESULT_DIR, exist_ok=True)
-
-# ────────────────────────────────────────────────────────────────────────────
-# JSON 존재 확인
-json_paths = glob.glob(os.path.join(LABEL_DIR, '*.json'))
-if not json_paths:
-    raise FileNotFoundError(f"No .json files found in {LABEL_DIR}")
-
-# ────────────────────────────────────────────────────────────────────────────
-# 모델 로드
-model = GRUAnomalyDetector().to(DEVICE)
 try:
-    state = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True)  # PyTorch 2.4+
-except TypeError:
-    state = torch.load(MODEL_PATH, map_location=DEVICE)
-model.load_state_dict(state)
-model.eval()
+    cv2.setNumThreads(1)
+except Exception:
+    pass
 
-# 모델 출력이 확률([0,1])이라고 가정 → BCELoss
-criterion = nn.BCELoss()
+from utils.video_vlm import init_model
+try:
+    # must exist; we won't use run_video_inference to avoid decoders
+    from utils.video_vlm import run_frames_inference
+except Exception:
+    print("[ERROR] run_frames_inference not found in utils/video_vlm.py")
+    print("        Please add it (see previously provided InternVL implementation).")
+    sys.exit(1)
 
-# ────────────────────────────────────────────────────────────────────────────
-# 헬퍼: frame_meta에서 "윈도우의 끝 프레임(e_frame)"만 안전 추출
-def _extract_window_end(meta_item, seq_len=SEQ_LEN):
+# ----------------- helpers -----------------
+YES_TOKENS = {"yes", "y", "true", "1", "yeah", "yep", "affirmative"}
+
+def text_norm(s: str) -> str:
+    import re
+    return re.sub(r'[\W_]+', ' ', (s or '')).strip().lower()
+
+def is_yes(s: str) -> bool:
+    t = text_norm(s)
+    return t in YES_TOKENS or t.startswith("yes")
+
+YES_TOKENS = {"yes", "y", "true", "1", "yeah", "yep", "affirmative"}
+
+def text_norm(s: str) -> str:
+    import re
+    return re.sub(r'[\W_]+', ' ', (s or '')).strip().lower()
+
+def is_yes(s: str) -> bool:
+    t = text_norm(s)
+    return t in YES_TOKENS or t.startswith("yes")
+
+def is_fall_positive(qa_pairs):
     """
-    meta_item 예시:
-      - [f0, f1, ..., f_{L-1}] : 마지막 원소를 end로 사용
-      - {'end': e} 또는 {'e': e} : 그대로 사용
-      - {'start': s} 또는 {'s': s} : s + (L-1)
-      - 단일 int(센터/시작 등으로 저장했다면) : 값 + (L-1)
-    실패 시 None 반환
+    변경된 규칙:
+    - 첫 번째 답변이 Yes(계열)면 Positive
     """
-    if isinstance(meta_item, (list, tuple)) and len(meta_item) > 0:
-        return int(meta_item[-1])
-    if isinstance(meta_item, dict):
-        if 'end' in meta_item:
-            return int(meta_item['end'])
-        if 'e' in meta_item:
-            return int(meta_item['e'])
-        if 'last' in meta_item:
-            return int(meta_item['last'])
-        if 'center' in meta_item:
-            return int(meta_item['center']) + (seq_len // 2)
-        if 'start' in meta_item or 's' in meta_item:
-            s = int(meta_item.get('start', meta_item.get('s')))
-            return s + seq_len - 1
-    if isinstance(meta_item, (int, np.integer)):
-        return int(meta_item) + seq_len - 1
-    return None
+    if not qa_pairs:
+        return False
+    return is_yes(qa_pairs[0][1])
 
-# ────────────────────────────────────────────────────────────────────────────
-# 윈도우 단위 타임라인 플롯 (end-aligned)
-def _plot_timeline_window(vid, t_end, gt_win, prob_win, pred_win, out_dir, threshold=0.5):
-    if len(t_end) == 0:
+
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
+
+def now_str() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+def unique_path(base_dir: str, base_name: str) -> str:
+    p = os.path.join(base_dir, base_name)
+    if not os.path.exists(p):
+        return p
+    root, ext = os.path.splitext(base_name)
+    i = 1
+    while True:
+        cand = os.path.join(base_dir, f"{root}_{i}{ext}")
+        if not os.path.exists(cand):
+            return cand
+        i += 1
+
+def parse_roi(val: str) -> Optional[Tuple[int,int,int,int]]:
+    val = (val or "").strip()
+    if not val:
         return None
+    parts = [x for x in val.replace(",", " ").split() if x]
+    if len(parts) != 4:
+        raise ValueError("ROI must be 'x1,y1,x2,y2'")
+    x1, y1, x2, y2 = map(int, parts)
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError("ROI must satisfy x2>x1 and y2>y1")
+    return (x1, y1, x2, y2)
 
-    # 시간 기준 정렬
-    order = np.argsort(t_end)
-    t_end   = np.asarray(t_end, dtype=float)[order]
-    gt_win  = np.asarray(gt_win, dtype=float)[order]
-    pred_win= np.asarray(pred_win, dtype=float)[order]
-    prob_win= np.asarray(prob_win, dtype=float)[order]
+def uniform_indices(total: int, n: int) -> List[int]:
+    if total <= 0:
+        return []
+    n = max(1, int(n))
+    if n == 1:
+        return [total - 1]  # last frame
+    return np.linspace(0, total - 1, n).astype(int).tolist()
 
-    fig, ax = plt.subplots(figsize=(12, 4))
-    # 윈도우 "끝 시각"에 값을 붙여서 step(post)로 그리면 겹침 없이 1:1 표현
-    ax.step(t_end, gt_win,   where='post', linewidth=2, label='GT (window)')
-    ax.step(t_end, pred_win, where='post', linewidth=2, linestyle='--', label='Pred (0/1)')
-    ax.plot(t_end, prob_win, linewidth=1.5, alpha=0.9, label='Pred Prob')
-    ax.axhline(threshold, linestyle=':', linewidth=1, label=f'Threshold={threshold}')
+def crop_downscale(frame_bgr: np.ndarray, roi: Optional[Tuple[int,int,int,int]], target_w: int) -> np.ndarray:
+    f = frame_bgr
+    if roi is not None:
+        x1, y1, x2, y2 = roi
+        f = f[y1:y2, x1:x2]
+    if target_w and target_w > 0 and f.shape[1] > target_w:
+        h, w = f.shape[:2]
+        scale = target_w / float(w)
+        f = cv2.resize(f, (target_w, max(1, int(h*scale))), interpolation=cv2.INTER_AREA)
+    return f
 
-    ax.set_xlabel('Time (s)')
-    ax.set_ylabel('Score / Class')
-    ax.set_ylim(-0.05, 1.05)
-    ax.set_title(f'Result — {vid}')
-    ax.legend(loc='upper right')
-    ax.grid(True, alpha=0.3)
+def list_videos(input_dir: str, exts: List[str], recursive: bool) -> List[str]:
+    vids = []
+    for e in exts:
+        e = e if e.startswith(".") else "." + e
+        pattern = os.path.join(input_dir, "**", f"*{e}") if recursive else os.path.join(input_dir, f"*{e}")
+        vids.extend(glob.glob(pattern, recursive=recursive))
+    vids = [v for v in vids if os.path.isfile(v)]
+    vids.sort()
+    return vids
 
-    os.makedirs(out_dir, exist_ok=True)
-    save_png = osp.join(out_dir, f'{vid}_timeline_window.png')
-    fig.tight_layout()
-    fig.savefig(save_png, dpi=200)
-    plt.close(fig)
+# -------- OpenCV-only frame access (no decord/pyav) --------
+def get_meta_opencv(path: str) -> Tuple[float, int]:
+    """Return (fps, total_frames). If count is 0, do a counting pass."""
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {path}")
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    cap.release()
+    if total <= 0:
+        # fallback: count frames (short clips -> OK)
+        cap = cv2.VideoCapture(path)
+        total = 0
+        ok = True
+        while ok:
+            ok, _ = cap.read()
+            if ok:
+                total += 1
+        cap.release()
+    if fps <= 1e-6:
+        fps = 25.0
+    return fps, total
 
-    # CSV 저장 (윈도우 끝 시각 기준)
-    save_csv = osp.join(out_dir, f'{vid}_timeline_window.csv')
-    with open(save_csv, 'w', newline='') as f:
-        w = csv.writer(f)
-        w.writerow(['t_end(s)', 'gt_window', 'pred_window', 'prob'])
-        for te, g, p, pr in zip(t_end, gt_win, pred_win, prob_win):
-            w.writerow([f"{te:.6f}", int(g), int(p), f"{pr:.6f}"])
+def sample_frames_opencv(path: str, indices: List[int], roi: Optional[Tuple[int,int,int,int]], target_w: int) -> List[np.ndarray]:
+    frames = []
+    if not indices:
+        return frames
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video: {path}")
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    for i in indices:
+        idx = i if total <= 0 else max(0, min(i, total - 1))
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        ok, bgr = cap.read()
+        if not ok or bgr is None:
+            # try sequential read fallback
+            ok, bgr = cap.read()
+            if not ok or bgr is None:
+                continue
+        frames.append(crop_downscale(bgr, roi, target_w))
+    cap.release()
+    return frames
 
-    return save_png
+def write_frames_to_temp_video(frames_bgr: List[np.ndarray], fps: float, prefer_container: str = "avi") -> str:
+    """Only used when save_mode='skim'; writes a thin clip to /dev/shm."""
+    if not frames_bgr:
+        raise ValueError("No frames to write.")
+    h, w = frames_bgr[0].shape[:2]
+    tmpdir = "/dev/shm" if os.path.isdir("/dev/shm") else None
+    if prefer_container == "avi":
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        suffix = ".avi"
+        alt_fourcc = cv2.VideoWriter_fourcc(*"mp4v"); alt_suffix = ".mp4"
+    else:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        suffix = ".mp4"
+        alt_fourcc = cv2.VideoWriter_fourcc(*"MJPG"); alt_suffix = ".avi"
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(dir=tmpdir, suffix=suffix, delete=False)
+    path = tmp.name; tmp.close()
+    vw = cv2.VideoWriter(path, fourcc, max(float(fps or 10.0), 1.0), (w, h))
+    if not vw.isOpened():
+        os.remove(path)
+        tmp = tempfile.NamedTemporaryFile(dir=tmpdir, suffix=alt_suffix, delete=False)
+        path = tmp.name; tmp.close()
+        vw = cv2.VideoWriter(path, alt_fourcc, max(float(fps or 10.0), 1.0), (w, h))
+        if not vw.isOpened():
+            os.remove(path)
+            raise RuntimeError("VideoWriter open failed for both containers.")
+    for f in frames_bgr:
+        vw.write(f)
+    vw.release()
+    return path
+# -----------------------------------------------------------
 
-# ────────────────────────────────────────────────────────────────────────────
-# 멀티 비디오 데이터셋 (디렉토리 전체 평가)
-eval_dataset = MultiVideoAnomalyDataset(
-    label_dir   = LABEL_DIR,
-    seq_len     = SEQ_LEN,
-    default_roi = (0, 0, 999999, 999999),   # 전체 프레임 사용
-    transform   = None
-)
-if len(eval_dataset) == 0:
-    raise RuntimeError(
-        "MultiVideoAnomalyDataset has 0 samples. "
-        "SEQ_LEN / ROI / 라벨 파일 내용을 확인해 주세요."
-    )
+# ----------------- core batch logic -----------------
+def process_video(video_path: str, model, tokenizer, args) -> dict:
+    t0 = time.monotonic()
 
-eval_loader = DataLoader(
-    eval_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    num_workers=0,
-    pin_memory=torch.cuda.is_available()
-)
+    # meta + sampling indices
+    fps, total = get_meta_opencv(video_path)
+    gate_idxs = uniform_indices(total, args.gate_segments)
+    desc_idxs = uniform_indices(total, args.desc_segments)
 
-# ────────────────────────────────────────────────────────────────────────────
-# 평가 루프 (완전 '윈도우 단위')
-total_loss = 0.0
-total_elems = 0
-all_probs, all_preds, all_labels = [], [], []
+    qa_gate: List[Tuple[str, str]] = []
+    qa_desc: List[Tuple[str, str]] = []
+    saved_path = ""
 
-# 비디오별 윈도우-종단시각 수집
-per_video_win = defaultdict(lambda: {'t_end': [], 'gt': [], 'prob': [], 'pred': []})
+    # ---------- Stage 1: gate ----------
+    t_gate0 = time.monotonic()
+    try:
+        gate_frames = sample_frames_opencv(video_path, gate_idxs, args.roi, args.target_width)
+        if not gate_frames:
+            raise RuntimeError("No frames sampled for Stage1.")
+        qa_gate = run_frames_inference(
+            model=model, tokenizer=tokenizer,
+            frames=gate_frames,
+            generation_config={"max_new_tokens": args.gate_max_new_tokens,
+                               "do_sample": args.gate_do_sample},
+            num_segments=len(gate_frames),
+            max_num=args.max_patches
+        )
+    except Exception as e:
+        print(f"[ERROR] Gate inference failed for {os.path.basename(video_path)}: {e}")
+        return {
+            "video": video_path, "fall": False, "saved_path": "",
+            "fps_est": float(fps), "qa_gate": [], "qa_desc": [],
+            "elapsed_gate": time.monotonic()-t_gate0, "elapsed_desc": 0.0
+        }
+    t_gate1 = time.monotonic()
+    fall_yes = is_fall_positive(qa_gate)
 
-samples_ref = getattr(eval_dataset, 'samples', None)  # (video_path, frame_meta, label, roi) 가정
-if samples_ref is None:
-    raise RuntimeError("eval_dataset.samples 를 찾을 수 없습니다. MultiVideoAnomalyDataset에 samples 속성이 필요합니다.")
+    # ---------- Stage 2: description (+ save) ----------
+    t_desc0 = time.monotonic()
+    if fall_yes:
+        try:
+            desc_frames = sample_frames_opencv(video_path, desc_idxs, args.roi, args.target_width)
+            if not desc_frames:
+                raise RuntimeError("No frames sampled for Stage2.")
+            qa_desc = run_frames_inference(
+                model=model, tokenizer=tokenizer,
+                frames=desc_frames,
+                generation_config={"max_new_tokens": args.desc_max_new_tokens,
+                                   "do_sample": args.desc_do_sample},
+                num_segments=len(desc_frames),
+                max_num=args.max_patches
+            )
+            # save positive
+            scenes_dir = os.path.join(args.alerts_dir, "scenes"); ensure_dir(scenes_dir)
+            if args.save_mode == "copy":
+                base = f"fall_{now_str()}_{os.path.basename(video_path)}"
+                saved_path = unique_path(scenes_dir, base)
+                shutil.copy2(video_path, saved_path)
+            elif args.save_mode == "skim":
+                path = write_frames_to_temp_video(
+                    desc_frames, fps=min(fps, args.save_skim_fps), prefer_container=args.save_container
+                )
+                base = f"fall_{now_str()}{os.path.splitext(path)[1]}"
+                dest = unique_path(scenes_dir, base)
+                try:
+                    shutil.move(path, dest)
+                    saved_path = dest
+                except Exception:
+                    saved_path = path
+            else:
+                saved_path = ""
+        except Exception as e:
+            print(f"[ERROR] Desc/save failed for {os.path.basename(video_path)}: {e}")
+    t_desc1 = time.monotonic()
 
-global_idx = 0  # DataLoader 순회시 현재 샘플의 전역 인덱스
+    # ---------- Logging positives ----------
+    if fall_yes:
+        logs_dir = os.path.join(args.alerts_dir, "logs"); ensure_dir(logs_dir)
+        rec = {
+            "timestamp": datetime.now().isoformat(timespec='seconds'),
+            "video": video_path,
+            "saved_path": saved_path,
+            "roi": args.roi,
+            "fps_est": float(fps),
+            "gate_segments": args.gate_segments,
+            "gate_max_new_tokens": args.gate_max_new_tokens,
+            "desc_segments": args.desc_segments,
+            "desc_max_new_tokens": args.desc_max_new_tokens,
+            "save_mode": args.save_mode,
+            "save_container": args.save_container,
+            "qa": (qa_gate + [("-----","-----")] + qa_desc)
+        }
+        jsonl = os.path.join(logs_dir, "vlm_results.jsonl")
+        try:
+            with open(jsonl, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print(f"[WARN] JSONL append failed: {e}")
 
-with torch.no_grad():
-    for seqs, labels in tqdm(eval_loader, desc='Eval (multi-video, window-level)', unit='batch'):
-        seqs   = seqs.to(DEVICE)
-        labels = labels.to(DEVICE).float().reshape(-1)     # [B]
+    # ---------- stdout summary ----------
+    if fall_yes:
+        print(f"\n=== FALL detected in {os.path.basename(video_path)} ===")
+        for q, a in (qa_gate + [("-----","-----")] + qa_desc):
+            print(f"Q: {q}\nA: {a}\n")
+        if saved_path:
+            print(f"[SAVED] {saved_path}")
+    else:
+        if args.verbose:
+            print(f"[INFO] No fall: {os.path.basename(video_path)}")
 
-        probs = model(seqs).float().reshape(-1)            # [B]
-        if probs.shape != labels.shape:
-            raise RuntimeError(f"Shape mismatch: probs {probs.shape}, labels {labels.shape}")
+    return {
+        "video": video_path,
+        "fall": fall_yes,
+        "saved_path": saved_path,
+        "fps_est": float(fps),
+        "qa_gate": qa_gate,
+        "qa_desc": qa_desc,
+        "elapsed_gate": t_gate1 - t_gate0,
+        "elapsed_desc": (t_desc1 - t_desc0) if fall_yes else 0.0
+    }
 
-        loss = criterion(probs, labels)
-        total_loss  += loss.item() * labels.numel()
-        total_elems += labels.numel()
+# ----------------- CLI -----------------
+def build_argparser():
+    p = argparse.ArgumentParser(description="Batch VLM evaluation over a video folder (OpenCV-only frames_direct).")
+    # IO
+    p.add_argument("--input_dir", required=True, help="Directory containing video files")
+    p.add_argument("--exts", default=".mp4,.avi,.mov,.mkv", help="Comma-separated extensions")
+    p.add_argument("--recursive", action="store_true", help="Recurse into subfolders")
+    p.add_argument("--limit", type=int, default=0, help="Process only first N videos (0=all)")
+    p.add_argument("--alerts_dir", default="alerts", help="Base dir for scenes/ and logs/")
+    p.add_argument("--save_mode", default="copy", choices=["copy","skim","none"],
+                   help="On positive: copy original, or save skim clip, or none")
+    p.add_argument("--save_container", default="avi", choices=["avi","mp4"],
+                   help="Container for skim clip")
+    p.add_argument("--save_skim_fps", type=float, default=8.0, help="FPS for skim clip")
+    # Model
+    p.add_argument("--model_id", default=None, help="HF model id/path for init_model(path=...)")
+    p.add_argument("--prewarm", action="store_true", help="Do a warm-up call")
+    p.add_argument("--no_prewarm", dest="prewarm", action="store_false")
+    p.set_defaults(prewarm=True)
+    # Sampling / preprocessing
+    p.add_argument("--roi", default="", help="ROI as 'x1,y1,x2,y2' (optional)")
+    p.add_argument("--target_width", type=int, default=480, help="Downscale width after ROI")
+    p.add_argument("--max_patches", type=int, default=1, help="InternVL tiling patches per frame (smaller=faster)")
+    # Gating (Stage 1)
+    p.add_argument("--gate_segments", type=int, default=1, help="Frames for gate (1=last frame only)")
+    p.add_argument("--gate_max_new_tokens", type=int, default=2, help="Tokens for gate")
+    p.add_argument("--gate_do_sample", action="store_true", help="Sampling for gate")
+    # Description (Stage 2)
+    p.add_argument("--desc_segments", type=int, default=3, help="Frames for description")
+    p.add_argument("--desc_max_new_tokens", type=int, default=64, help="Tokens for description")
+    p.add_argument("--desc_do_sample", action="store_true", help="Sampling for description")
+    # Misc
+    p.add_argument("--verbose", action="store_true")
+    return p
 
-        preds = (probs >= 0.5).float()
+def main():
+    args = build_argparser().parse_args()
 
-        # 전체 메트릭용 누적
-        all_probs.extend(probs.detach().cpu().tolist())
-        all_preds.extend(preds.detach().cpu().tolist())
-        all_labels.extend(labels.detach().cpu().tolist())
+    # Prepare IO
+    ensure_dir(args.alerts_dir)
+    ensure_dir(os.path.join(args.alerts_dir, "scenes"))
+    ensure_dir(os.path.join(args.alerts_dir, "logs"))
 
-        # ── 영상별: 윈도우 "끝 시각"만 기록 (겹침 제거, 1:1 정렬)
-        bs = probs.numel()
-        for i in range(bs):
-            if global_idx >= len(samples_ref):
-                break
+    # Parse ROI
+    try:
+        args.roi = parse_roi(args.roi)
+    except Exception as e:
+        print(f"[ERROR] Invalid ROI: {e}")
+        sys.exit(1)
 
-            sample_tuple = samples_ref[global_idx]
-            video_path = sample_tuple[0]
-            frame_meta = sample_tuple[1] if len(sample_tuple) > 1 else None
-            vid = osp.splitext(osp.basename(video_path))[0]
+    # List videos
+    exts = [e.strip() for e in args.exts.split(",") if e.strip()]
+    videos = list_videos(args.input_dir, exts, args.recursive)
+    if args.limit and args.limit > 0:
+        videos = videos[:args.limit]
+    if not videos:
+        print("[WARN] No videos found.")
+        sys.exit(0)
 
-            e_frame = _extract_window_end(frame_meta, SEQ_LEN)
-            if e_frame is None:
-                # 같은 비디오 안에서 이전 end가 있다면 +1 프레임, 없으면 첫 윈도우 가정
-                rec = per_video_win[vid]
-                if len(rec['t_end']) == 0:
-                    e_frame = SEQ_LEN - 1
-                else:
-                    # 직전 t_end를 프레임으로 환산 후 +1
-                    last_e_frame = int(round(rec['t_end'][-1] * FPS)) - 1
-                    e_frame = last_e_frame + 1
+    # Load VLM
+    print("[INFO] Loading VLM...")
+    t0 = time.monotonic()
+    if args.model_id:
+        model, tokenizer = init_model(path=args.model_id)
+    else:
+        model, tokenizer = init_model()
+    print(f"[INFO] VLM loaded in {time.monotonic()-t0:.2f}s (frames_direct=True)")
 
-            # 윈도우 끝 "직후" 시각(초) = (e_frame + 1) / FPS
-            t_end = float(e_frame + 1) / float(FPS)
+    # Warm-up (optional)
+    if args.prewarm:
+        print("[INFO] Warming up VLM...")
+        try:
+            dummy = np.zeros((224,224,3), dtype=np.uint8)
+            _ = run_frames_inference(
+                model=model, tokenizer=tokenizer,
+                frames=[dummy],
+                generation_config={"max_new_tokens": 8, "do_sample": False},
+                num_segments=1, max_num=1
+            )
+        except Exception as e:
+            print(f"[WARN] Warm-up skipped: {e}")
+        print("[INFO] Warm-up done.")
 
-            per_video_win[vid]['t_end'].append(t_end)
-            per_video_win[vid]['gt'].append(float(labels[i].item()))
-            per_video_win[vid]['prob'].append(float(probs[i].item()))
-            per_video_win[vid]['pred'].append(float(preds[i].item()))
+    # Process
+    n_total = len(videos)
+    n_pos = 0
+    total_gate = 0.0
+    total_desc = 0.0
 
-            global_idx += 1
+    for k, vp in enumerate(videos, 1):
+        print(f"\n[{k}/{n_total}] {os.path.basename(vp)}")
+        res = process_video(vp, model, tokenizer, args)
+        if res["fall"]:
+            n_pos += 1
+        total_gate += res.get("elapsed_gate", 0.0)
+        total_desc += res.get("elapsed_desc", 0.0)
 
-# ────────────────────────────────────────────────────────────────────────────
-# 메트릭 계산 (윈도우 단위 평균)
-avg_loss  = float(total_loss / total_elems) if total_elems > 0 else float('nan')
-precision = float(precision_score(all_labels, all_preds, zero_division=0))
-recall    = float(recall_score(all_labels, all_preds, zero_division=0))
-f1        = float(f1_score(all_labels, all_preds, zero_division=0))
-try:
-    roc_auc = float(roc_auc_score(all_labels, all_probs)) if len(set(all_labels)) > 1 else float('nan')
-except ValueError:
-    roc_auc = float('nan')
+    print("\n=== Summary ===")
+    print(f"Processed: {n_total}")
+    print(f"Positives: {n_pos}")
+    if n_total > 0:
+        print(f"Avg gate time: {total_gate / n_total:.2f}s")
+    if n_pos > 0:
+        print(f"Avg desc time (positives): {total_desc / n_pos:.2f}s")
 
-metrics_mean = {
-    'Avg Loss' : avg_loss,
-    'Precision': precision,
-    'Recall'   : recall,
-    'F1 Score' : f1,
-    'ROC AUC'  : roc_auc,
-}
-
-# 저장
-with open(os.path.join(RESULT_DIR, 'overall_metrics.json'), 'w') as f:
-    json.dump(metrics_mean, f, indent=2)
-
-# ────────────────────────────────────────────────────────────────────────────
-# 레이더 차트 (0~1 스케일 지표만)
-radar_keys = ['Precision', 'Recall', 'F1 Score', 'ROC AUC']
-radar_vals = []
-for k in radar_keys:
-    v = metrics_mean[k]
-    if np.isnan(v):
-        v = 0.0
-    radar_vals.append(float(max(0.0, min(1.0, v))))
-
-angles = np.linspace(0, 2 * np.pi, len(radar_keys), endpoint=False).tolist()
-angles += angles[:1]
-radar_vals += radar_vals[:1]
-
-fig = plt.figure(figsize=(6, 6))
-ax = fig.add_subplot(111, polar=True)
-ax.plot(angles, radar_vals, 'o-', linewidth=2)
-ax.fill(angles, radar_vals, alpha=0.25)
-ax.set_thetagrids(np.degrees(angles[:-1]), radar_keys, fontsize=14)
-ax.set_ylim(0, 1)
-ax.set_title('Overall Average Metrics (Window-level)', y=1.1, fontsize=16)
-
-for a, v in zip(angles[:-1], radar_vals[:-1]):
-    ax.text(a, min(1.0, v + 0.05), f"{v:.2f}", ha='center', va='center', fontsize=12)
-
-out_path = os.path.join(RESULT_DIR, 'overall_metrics.png')
-plt.tight_layout()
-plt.savefig(out_path, dpi=300)
-plt.close()
-
-print(f"Saved overall radar plot → {out_path}")
-print("Saved overall metrics →", os.path.join(RESULT_DIR, 'overall_metrics.json'))
-
-# ────────────────────────────────────────────────────────────────────────────
-# 비디오별 '윈도우 단위(end-aligned)' 타임라인 저장
-TL_DIR = osp.join(RESULT_DIR, 'timelines_window')
-os.makedirs(TL_DIR, exist_ok=True)
-
-print("\nSaving per-video window-aligned timelines...")
-saved_cnt = 0
-for vid, rec in per_video_win.items():
-    out_png = _plot_timeline_window(
-        vid,
-        rec['t_end'],
-        rec['gt'],
-        rec['prob'],
-        rec['pred'],
-        TL_DIR,
-        threshold=0.5
-    )
-    if out_png:
-        print(f"  - {vid}: {out_png}")
-        saved_cnt += 1
-
-if saved_cnt == 0:
-    print("  (No timelines were generated.)")
-else:
-    print(f"Done. {saved_cnt} timeline(s) saved under {TL_DIR}")
+if __name__ == "__main__":
+    main()

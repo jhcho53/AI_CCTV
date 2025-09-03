@@ -44,21 +44,24 @@ except Exception:
 YES_TOKENS = {"yes", "y", "true", "1", "yeah", "yep", "affirmative"}
 
 def text_norm(s: str) -> str:
+    import re
     return re.sub(r'[\W_]+', ' ', (s or '')).strip().lower()
 
 def is_yes(s: str) -> bool:
     t = text_norm(s)
     return t in YES_TOKENS or t.startswith("yes")
 
-def is_fall_positive(qa_pairs: List[Tuple[str, str]]) -> bool:
-    """첫 Q/A가 fall/fallen/fall down 포함 & 첫 답이 Yes/True면 True"""
+def is_fall_positive(qa_pairs):
+    """
+    변경된 규칙:
+    - Q/A 목록의 첫 번째 답변이 'Yes(계열)'이면 Positive
+    - 질문 내용(키워드)은 더 이상 사용하지 않음
+    """
     if not qa_pairs:
         return False
-    q0, a0 = qa_pairs[0]
-    qn = f" {text_norm(q0)} "
-    if (" fall " in qn) or (" fallen " in qn) or (" fall down " in qn):
-        return is_yes(a0)
-    return False
+    # qa_pairs: List[Tuple[question, answer]]
+    first_answer = qa_pairs[0][1]
+    return is_yes(first_answer)
 
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
