@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ROS2 Image subscriber → 5s chunk VLM inference (no anomaly model)
+ROS2 Image subscriber → 5s chunk VLM inference (no anomaly model), multi-camera.
 
-Legacy video_vlm API compatibility:
-- Assumes utils.video_vlm.run_frames_inference / run_video_inference DO NOT accept a `prompt`.
-- Those functions always ask two fixed questions internally:
+Legacy video_vlm API compatibility (NO prompt support):
+- utils.video_vlm.run_frames_inference / run_video_inference do NOT accept a `prompt`.
+- Those functions internally ask two fixed questions:
   (1) fall (Yes/No), then (2) scene description.
 - This node gates by checking the FIRST answer (must be Yes/No).
 
 Pipeline (memory-efficient):
-- Collect raw ROS2 images into 5-second chunks.
+- Collect raw ROS2 images into 5-second chunks (per camera).
 - At ingest time, apply ROI crop (clamped) + downscale, then store ONLY JPEG bytes (not full frames).
 - Stage 1 (gating): decode only a few sampled JPEGs and run VLM with tiny token budget.
 - If first answer is Yes → Stage 2 (description): decode another few frames and run VLM with a larger token budget.
 - If fall is positive and saving is enabled, stream JPEGs to a video file (no large RAM usage).
 - If frames-direct inference is unavailable, fall back to creating a small temp video under /dev/shm.
+- Warm-up timings and per-chunk performance are logged.
 
-Also prints warm-up timings and per-chunk performance (collection vs VLM time).
+Multi-camera:
+- camera_count: number of cameras (default 1)
+- image_topic_tmpl: input topic template including "{idx}" placeholder, e.g., "/camera{idx}/image_raw"
+- For camera_count==1, the legacy "image_topic" is respected.
 """
 
 import os
@@ -32,8 +36,10 @@ import tempfile
 import shutil
 import re
 import numpy as np
+from dataclasses import dataclass, field
+from collections import deque
 from datetime import datetime
-from typing import List, Tuple, Optional, Any
+from typing import List, Tuple, Optional, Any, Deque, Dict
 
 try:
     cv2.setNumThreads(1)
@@ -250,13 +256,26 @@ def jpegs_sample_to_video(
     return path
 
 
-# ---------- ROS2 node ----------
+# ---------- Per-camera context ----------
+@dataclass
+class CamCtx:
+    idx: int
+    topic: str
+    chunk_jpegs: List[bytes] = field(default_factory=list)
+    frame_size: Optional[Tuple[int, int]] = None
+    chunk_start_t: Optional[float] = None
+    processing: bool = False
+
+
+# ---------- ROS2 node (multi-camera) ----------
 class VLMGatedNode(Node):
     def __init__(self):
-        super().__init__("vlm_chunk_recorder_gated")
+        super().__init__("vlm_chunk_recorder_gated_multi")
 
         # Inputs / general
-        self.declare_parameter("image_topic", "/camera/image_raw")
+        self.declare_parameter("image_topic", "/camera/image_raw")      # legacy (single-camera)
+        self.declare_parameter("camera_count", 1)                       
+        self.declare_parameter("image_topic_tmpl", "/camera{idx}/image_raw") 
         self.declare_parameter("chunk_secs", 5.0)
         self.declare_parameter("est_fps", 15.0)
         self.declare_parameter("roi", "")                  # "x1,y1,x2,y2" string (or [] with a param file)
@@ -286,7 +305,10 @@ class VLMGatedNode(Node):
 
         # Resolve parameters
         gp = self.get_parameter
-        self.image_topic = gp("image_topic").get_parameter_value().string_value
+        self.single_topic = gp("image_topic").get_parameter_value().string_value
+        self.camera_count = int(gp("camera_count").value)
+        self.topic_tmpl   = gp("image_topic_tmpl").get_parameter_value().string_value
+
         self.chunk_secs  = float(gp("chunk_secs").value)
         self.est_fps     = float(gp("est_fps").value)
         self.alerts_dir  = gp("alerts_dir").get_parameter_value().string_value
@@ -356,73 +378,80 @@ class VLMGatedNode(Node):
                 self.get_logger().warning(f"Warm-up skipped: {e}")
             self.get_logger().info("Warm-up done.")
 
-        # State (memory-saver: keep only JPEG bytes)
+        # State
         self.bridge = CvBridge()
-        self.chunk_jpegs: List[bytes] = []                # JPEG bytes after ROI+downscale
-        self.frame_size: Optional[Tuple[int, int]] = None # (w, h) after crop/downscale
-        self.chunk_start_t: Optional[float] = None
-        self.processing = False
+        self.cams: Dict[int, CamCtx] = {}
+        self.subs: List[Any] = []
 
-        # ROS wiring
-        self.sub = self.create_subscription(Image, self.image_topic, self.image_cb, 10)
+        # Build subscriptions
+        topics: List[str]
+        if self.camera_count <= 1:
+            topics = [self.single_topic]
+        else:
+            topics = [self.topic_tmpl.replace("{idx}", str(i)) for i in range(self.camera_count)]
+
+        for i, topic in enumerate(topics):
+            self.cams[i] = CamCtx(idx=i, topic=topic)
+            self.subs.append(self.create_subscription(Image, topic, self._make_image_cb(i), 10))
+            self.get_logger().info(f"[cam{i}] Subscribed: {topic}")
+
+        # One timer for all cameras
         self.timer = self.create_timer(0.05, self.timer_cb)
-        self.get_logger().info(f"Subscribed: {self.image_topic} | chunk_secs={self.chunk_secs}s")
+        self.get_logger().info(f"chunk_secs={self.chunk_secs}s, cameras={len(self.cams)}")
 
-    # ---------- Callbacks ----------
-    def image_cb(self, msg: Image):
-        """Collect frames: apply ROI+downscale and store as JPEG bytes only."""
-        if self.processing:  # drop frames while inference is running
-            return
-        try:
-            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        except CvBridgeError as e:
-            self.get_logger().warning(f"CvBridgeError: {e}")
-            return
-        if frame is None:
-            return
+    # ---------- Per-camera Image callback ----------
+    def _make_image_cb(self, cam_idx: int):
+        def _cb(msg: Image):
+            cam = self.cams[cam_idx]
+            if cam.processing:  # drop while processing
+                return
+            try:
+                frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            except CvBridgeError as e:
+                self.get_logger().warning(f"[cam{cam_idx}] CvBridgeError: {e}")
+                return
+            if frame is None:
+                return
 
-        f_small = crop_downscale(frame, self.roi, self.target_w)
-        if self.frame_size is None:
-            self.frame_size = (int(f_small.shape[1]), int(f_small.shape[0]))
-        try:
-            jpg = bgr_to_jpeg_bytes(f_small, quality=self.jpeg_quality)
-            self.chunk_jpegs.append(jpg)
-        except Exception as e:
-            self.get_logger().warning(f"JPEG encode failed: {e}")
+            f_small = crop_downscale(frame, self.roi, self.target_w)
+            if cam.frame_size is None:
+                cam.frame_size = (int(f_small.shape[1]), int(f_small.shape[0]))
+            try:
+                jpg = bgr_to_jpeg_bytes(f_small, quality=self.jpeg_quality)
+                cam.chunk_jpegs.append(jpg)
+            except Exception as e:
+                self.get_logger().warning(f"[cam{cam_idx}] JPEG encode failed: {e}")
 
-        if self.chunk_start_t is None:
-            self.chunk_start_t = time.monotonic()
+            if cam.chunk_start_t is None:
+                cam.chunk_start_t = time.monotonic()
+        return _cb
 
+    # ---------- Timer: check all cameras ----------
     def timer_cb(self):
-        """Close chunk when time elapsed and trigger processing."""
-        if self.chunk_start_t is None or self.processing:
-            return
-        elapsed = time.monotonic() - self.chunk_start_t
-        if elapsed < self.chunk_secs:
-            return
+        for cam_idx, cam in self.cams.items():
+            if cam.chunk_start_t is None or cam.processing:
+                continue
+            elapsed = time.monotonic() - cam.chunk_start_t
+            if elapsed < self.chunk_secs:
+                continue
 
-        # Close the current chunk: swap buffers and process
-        jpegs_to_process = self.chunk_jpegs
-        size_wh = self.frame_size
-        self.chunk_jpegs = []
-        self.frame_size = None
-        chunk_elapsed = max(elapsed, 1e-3)
-        self.chunk_start_t = None
-        self.processing = True
-        try:
-            self.process_chunk_bytes(jpegs_to_process, size_wh, chunk_elapsed)
-        except Exception as e:
-            self.get_logger().error(f"process_chunk_bytes error: {e}")
-        finally:
-            self.processing = False
+            # close chunk
+            jpegs_to_process = cam.chunk_jpegs
+            size_wh = cam.frame_size
+            cam.chunk_jpegs = []
+            cam.frame_size = None
+            chunk_elapsed = max(elapsed, 1e-3)
+            cam.chunk_start_t = None
+            cam.processing = True
+            try:
+                self.process_chunk(cam, jpegs_to_process, size_wh, chunk_elapsed)
+            except Exception as e:
+                self.get_logger().error(f"[cam{cam_idx}] process_chunk error: {e}")
+            finally:
+                cam.processing = False
 
-    # ---------- Main processing (memory-efficient path) ----------
-    def process_chunk_bytes(self, jpegs: List[bytes], size_wh: Optional[Tuple[int, int]], elapsed_sec: float):
-        """
-        1) Stage 1 (gating): minimal tokens & segments, check first answer (Yes/No).
-        2) Stage 2 (description): only if fall positive, with larger token budget.
-        3) Save clip if configured.
-        """
+    # ---------- Main processing (per camera) ----------
+    def process_chunk(self, cam: CamCtx, jpegs: List[bytes], size_wh: Optional[Tuple[int, int]], elapsed_sec: float):
         if not jpegs or size_wh is None:
             return
 
@@ -430,11 +459,10 @@ class VLMGatedNode(Node):
         n = len(jpegs)
         fps = max(1.0, float(n) / float(elapsed_sec or 1.0))
         if n < 3:
-            # If too few frames, backstop with configured est_fps (avoid tiny fps)
             fps = max(fps, self.est_fps)
 
-        # ---- Stage 1: gating (decode only required frames) ----
-        self.get_logger().info("[Perf] Stage1 gate begin")
+        # ---- Stage 1: gating ----
+        self.get_logger().info(f"[cam{cam.idx}] [Perf] Stage1 gate begin")
         t_gate0 = time.monotonic()
         gate_idxs = uniform_indices(n, self.gate_segments)
         gate_frames = [jpeg_bytes_to_bgr(jpegs[i]) for i in gate_idxs]
@@ -448,7 +476,6 @@ class VLMGatedNode(Node):
                     num_segments=len(gate_frames), max_num=1
                 )
             else:
-                # frames-direct unavailable → create temp video with sampled frames
                 gate_clip = jpegs_sample_to_video(
                     jpegs, gate_idxs, size_wh, fps=min(fps, 10.0), prefer_container="avi"
                 )
@@ -465,20 +492,20 @@ class VLMGatedNode(Node):
                     except Exception:
                         pass
         except Exception as e:
-            self.get_logger().error(f"gate inference failed: {e}")
+            self.get_logger().error(f"[cam{cam.idx}] gate inference failed: {e}")
             return
         t_gate1 = time.monotonic()
 
         fall_yes = is_fall_positive(qa_gate)
-        self.get_logger().info(f"[Perf] Stage1 gate end (fall={fall_yes}) elapsed={t_gate1 - t_gate0:.2f}s")
+        self.get_logger().info(f"[cam{cam.idx}] [Perf] Stage1 gate end (fall={fall_yes}) elapsed={t_gate1 - t_gate0:.2f}s")
 
         if not fall_yes:
-            self.get_logger().info("No fall: discard chunk (skip Stage 2)")
-            self._log_perf(t0, elapsed_sec, vlm=t_gate1 - t_gate0, frames=n)
+            self.get_logger().info(f"[cam{cam.idx}] No fall: discard chunk (skip Stage 2)")
+            self._log_perf(cam.idx, t0, elapsed_sec, vlm=t_gate1 - t_gate0, frames=n)
             return
 
-        # ---- Stage 2: description (decode only required frames) ----
-        self.get_logger().info("[Perf] Stage2 desc begin")
+        # ---- Stage 2: description ----
+        self.get_logger().info(f"[cam{cam.idx}] [Perf] Stage2 desc begin")
         t_desc0 = time.monotonic()
         desc_idxs = uniform_indices(n, self.desc_segments)
         desc_frames = [jpeg_bytes_to_bgr(jpegs[i]) for i in desc_idxs]
@@ -493,7 +520,6 @@ class VLMGatedNode(Node):
                 )
                 saved_path = ""
             else:
-                # Fallback: create a temp video for description frames
                 desc_clip = jpegs_sample_to_video(
                     jpegs, desc_idxs, size_wh, fps=min(fps, 10.0), prefer_container="avi"
                 )
@@ -505,13 +531,13 @@ class VLMGatedNode(Node):
                         num_segments=len(desc_idxs), max_num=1
                     )
                 finally:
-                    saved_path = ""  # set below if saving succeeds
+                    saved_path = ""
                     try:
                         os.remove(desc_clip)
                     except Exception:
                         pass
         except Exception as e:
-            self.get_logger().error(f"desc inference failed: {e}")
+            self.get_logger().error(f"[cam{cam.idx}] desc inference failed: {e}")
             return
         t_desc1 = time.monotonic()
 
@@ -520,38 +546,36 @@ class VLMGatedNode(Node):
         if self.keep_raw:
             try:
                 if self.save_mode == "skim":
-                    # Record only description frames (ordered), with save_skim_fps
                     tmp_path = jpegs_sample_to_video(
                         jpegs, desc_idxs, size_wh, fps=self.save_skim_fps, prefer_container=self.save_container
                     )
                 else:
-                    # full: stream all JPEGs into a video
                     tmp_path = jpegs_to_temp_video(
                         jpegs, size_wh, fps=fps, prefer_container=self.save_container
                     )
-                # Move into scenes/
                 ext = os.path.splitext(tmp_path)[1] or (".avi" if self.save_container == "avi" else ".mp4")
-                dest = unique_path(self.scenes_dir, f"fall_{now_str()}{ext}")
+                dest = unique_path(self.scenes_dir, f"fall_cam{cam.idx}_{now_str()}{ext}")
                 try:
                     shutil.move(tmp_path, dest)
                 except Exception:
-                    dest = tmp_path  # keep original path on move failure
+                    dest = tmp_path
                 saved_path = dest
-                self.get_logger().info(f"[ALERT] FALL detected → saved: {saved_path}")
+                self.get_logger().info(f"[cam{cam.idx}] [ALERT] FALL detected → saved: {saved_path}")
             except Exception as e:
-                self.get_logger().warning(f"Save streaming failed: {e}")
+                self.get_logger().warning(f"[cam{cam.idx}] Save streaming failed: {e}")
                 saved_path = ""
 
         # ---- Output + logging ----
         qa_all = qa_gate + [("-----", "-----")] + qa_desc
         ts = datetime.now().isoformat(timespec='seconds')
-        print(f"\n=== [{ts}] FALL detected ===")
+        print(f"\n=== [cam{cam.idx}] [{ts}] FALL detected ===")
         for q, a in qa_all:
             print(f"Q: {q}\nA: {a}\n")
 
         rec = {
             "timestamp": ts,
-            "source_topic": self.image_topic,
+            "camera_idx": cam.idx,
+            "source_topic": cam.topic,
             "saved_path": saved_path,
             "roi": self.roi,
             "duration_sec": round(elapsed_sec, 3),
@@ -568,14 +592,14 @@ class VLMGatedNode(Node):
             with open(self.jsonl_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         except Exception as e:
-            self.get_logger().warning(f"JSONL append failed: {e}")
+            self.get_logger().warning(f"[cam{cam.idx}] JSONL append failed: {e}")
 
-        self._log_perf(t0, elapsed_sec, vlm=(t_gate1 - t_gate0) + (t_desc1 - t_desc0), frames=n)
+        self._log_perf(cam.idx, t0, elapsed_sec, vlm=(t_gate1 - t_gate0) + (t_desc1 - t_desc0), frames=n)
 
-    def _log_perf(self, t0, collect_s, vlm, frames):
+    def _log_perf(self, cam_idx: int, t0, collect_s, vlm, frames):
         t1 = time.monotonic()
         self.get_logger().info(
-            f"[Perf] collect={collect_s:.2f}s, vlm={vlm:.2f}s, total={t1 - t0:.2f}s, frames={frames}"
+            f"[cam{cam_idx}] [Perf] collect={collect_s:.2f}s, vlm={vlm:.2f}s, total={t1 - t0:.2f}s, frames={frames}"
         )
 
 
