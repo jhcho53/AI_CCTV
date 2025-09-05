@@ -2,21 +2,23 @@
 # -*- coding: utf-8 -*-
 """
 Batch VLM Evaluation over a directory of short video sequences (OpenCV-only, no ROS).
-- Hard-disable TensorFlow import by default (robust stub with __spec__/__path__)
-  to avoid CUDA/XLA conflicts. Can be disabled with ALLOW_TF_IMPORT=1.
+
+Design goals
+- Hard-disable TensorFlow import by default (robust stub with __spec__/__path__) to avoid CUDA/XLA conflicts.
+  (Opt-out: set ALLOW_TF_IMPORT=1)
 - Avoid decord/pyav; sample frames using OpenCV only.
 - Always use frames_direct (run_frames_inference) to feed frames directly to InternVL.
-- 2-stage gating:
+- Two-stage gating:
   1) Fast Yes/No with minimal tokens/frames
-  2) If Yes -> concise description + optional saving (copy or skim) + JSONL logging
+  2) If Yes → concise description + optional saving (copy or skim) + JSONL logging
 
-Requires:
-  - utils/video_vlm.py with:
-      init_model(...)
-      run_frames_inference(...)   # must exist
+Requirements
+- utils/video_vlm.py providing:
+    init_model(...)
+    run_frames_inference(...)   # legacy API: no prompt argument, returns [(Q,A), ...] with first answer = Yes/No
 """
 
-# ---------- robust TensorFlow stub (before ANY other import) ----------
+# ---------- Robust TensorFlow stub (before ANY other import) ----------
 import os, sys, types, importlib.machinery
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
@@ -36,7 +38,7 @@ def _stub_package(name: str):
     m.__path__ = []  # type: ignore
     sys.modules[name] = m
 
-# By default, block TF to avoid CUDA/XLA conflicts. Can be disabled via env.
+# By default, block TF to avoid CUDA/XLA conflicts. Can be disabled via env var.
 if os.environ.get("ALLOW_TF_IMPORT", "0").lower() not in ("1", "true", "yes", "y"):
     for mod in [
         "tensorflow",
@@ -45,7 +47,7 @@ if os.environ.get("ALLOW_TF_IMPORT", "0").lower() not in ("1", "true", "yes", "y
         "tensorflow.compat.v1",
         "tensorflow.compat.v2",
         "tf_keras",
-        "keras",  # some stacks try keras first
+        "keras",  # some stacks import keras first
     ]:
         _stub_package(mod)
 # ----------------------------------------------------------------------
@@ -67,51 +69,44 @@ except Exception:
 
 from utils.video_vlm import init_model
 try:
-    # must exist; we won't use run_video_inference to avoid decoders
+    # Must exist; we won't use run_video_inference to avoid other decoders.
     from utils.video_vlm import run_frames_inference
 except Exception:
     print("[ERROR] run_frames_inference not found in utils/video_vlm.py")
-    print("        Please add it (see previously provided InternVL implementation).")
+    print("        Please add it (see legacy InternVL frames_direct implementation).")
     sys.exit(1)
 
-# ----------------- helpers -----------------
+# ----------------- Helpers -----------------
 YES_TOKENS = {"yes", "y", "true", "1", "yeah", "yep", "affirmative"}
 
 def text_norm(s: str) -> str:
+    """Lowercase and collapse non-alnum to spaces for robust Yes matching."""
     import re
     return re.sub(r'[\W_]+', ' ', (s or '')).strip().lower()
 
 def is_yes(s: str) -> bool:
+    """Heuristic Yes detector."""
     t = text_norm(s)
     return t in YES_TOKENS or t.startswith("yes")
 
-YES_TOKENS = {"yes", "y", "true", "1", "yeah", "yep", "affirmative"}
-
-def text_norm(s: str) -> str:
-    import re
-    return re.sub(r'[\W_]+', ' ', (s or '')).strip().lower()
-
-def is_yes(s: str) -> bool:
-    t = text_norm(s)
-    return t in YES_TOKENS or t.startswith("yes")
-
-def is_fall_positive(qa_pairs):
+def is_fall_positive(qa_pairs: List[Tuple[str, str]]) -> bool:
     """
-    변경된 규칙:
-    - 첫 번째 답변이 Yes(계열)면 Positive
+    Fall-positive decision rule:
+    - Positive if and only if the FIRST answer in [(Q,A), ...] is a 'Yes' variant.
+    - The question text is not used.
     """
     if not qa_pairs:
         return False
     return is_yes(qa_pairs[0][1])
 
-
-def ensure_dir(p: str):
+def ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
 def now_str() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 def unique_path(base_dir: str, base_name: str) -> str:
+    """Return a unique path under base_dir using base_name; suffix with _N if exists."""
     p = os.path.join(base_dir, base_name)
     if not os.path.exists(p):
         return p
@@ -123,7 +118,8 @@ def unique_path(base_dir: str, base_name: str) -> str:
             return cand
         i += 1
 
-def parse_roi(val: str) -> Optional[Tuple[int,int,int,int]]:
+def parse_roi(val: str) -> Optional[Tuple[int, int, int, int]]:
+    """Parse ROI from 'x1,y1,x2,y2' (whitespace or commas)."""
     val = (val or "").strip()
     if not val:
         return None
@@ -136,22 +132,31 @@ def parse_roi(val: str) -> Optional[Tuple[int,int,int,int]]:
     return (x1, y1, x2, y2)
 
 def uniform_indices(total: int, n: int) -> List[int]:
+    """Pick n uniform indices in [0, total-1]."""
     if total <= 0:
         return []
     n = max(1, int(n))
     if n == 1:
-        return [total - 1]  # last frame
+        return [total - 1]  # last frame only (fast gating)
     return np.linspace(0, total - 1, n).astype(int).tolist()
 
-def crop_downscale(frame_bgr: np.ndarray, roi: Optional[Tuple[int,int,int,int]], target_w: int) -> np.ndarray:
+def crop_downscale(frame_bgr: np.ndarray, roi: Optional[Tuple[int, int, int, int]], target_w: int) -> np.ndarray:
+    """
+    Crop to ROI (clamped to frame bounds), then downscale to target_w (keeps aspect).
+    """
     f = frame_bgr
     if roi is not None:
+        H, W = f.shape[:2]
         x1, y1, x2, y2 = roi
-        f = f[y1:y2, x1:x2]
+        # Clamp ROI to image bounds to avoid out-of-range slicing
+        x1 = max(0, min(W, x1)); x2 = max(0, min(W, x2))
+        y1 = max(0, min(H, y1)); y2 = max(0, min(H, y2))
+        if x2 > x1 and y2 > y1:
+            f = f[y1:y2, x1:x2]
     if target_w and target_w > 0 and f.shape[1] > target_w:
         h, w = f.shape[:2]
         scale = target_w / float(w)
-        f = cv2.resize(f, (target_w, max(1, int(h*scale))), interpolation=cv2.INTER_AREA)
+        f = cv2.resize(f, (target_w, max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
     return f
 
 def list_videos(input_dir: str, exts: List[str], recursive: bool) -> List[str]:
@@ -166,7 +171,7 @@ def list_videos(input_dir: str, exts: List[str], recursive: bool) -> List[str]:
 
 # -------- OpenCV-only frame access (no decord/pyav) --------
 def get_meta_opencv(path: str) -> Tuple[float, int]:
-    """Return (fps, total_frames). If count is 0, do a counting pass."""
+    """Return (fps, total_frames). If frame count is 0, do a counting pass."""
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {path}")
@@ -174,7 +179,7 @@ def get_meta_opencv(path: str) -> Tuple[float, int]:
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     cap.release()
     if total <= 0:
-        # fallback: count frames (short clips -> OK)
+        # Fallback counting pass for short clips
         cap = cv2.VideoCapture(path)
         total = 0
         ok = True
@@ -187,7 +192,13 @@ def get_meta_opencv(path: str) -> Tuple[float, int]:
         fps = 25.0
     return fps, total
 
-def sample_frames_opencv(path: str, indices: List[int], roi: Optional[Tuple[int,int,int,int]], target_w: int) -> List[np.ndarray]:
+def sample_frames_opencv(
+    path: str,
+    indices: List[int],
+    roi: Optional[Tuple[int, int, int, int]],
+    target_w: int
+) -> List[np.ndarray]:
+    """Random access frames by index and apply ROI+downscale."""
     frames = []
     if not indices:
         return frames
@@ -200,7 +211,7 @@ def sample_frames_opencv(path: str, indices: List[int], roi: Optional[Tuple[int,
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
         ok, bgr = cap.read()
         if not ok or bgr is None:
-            # try sequential read fallback
+            # Try sequential read fallback
             ok, bgr = cap.read()
             if not ok or bgr is None:
                 continue
@@ -209,7 +220,9 @@ def sample_frames_opencv(path: str, indices: List[int], roi: Optional[Tuple[int,
     return frames
 
 def write_frames_to_temp_video(frames_bgr: List[np.ndarray], fps: float, prefer_container: str = "avi") -> str:
-    """Only used when save_mode='skim'; writes a thin clip to /dev/shm."""
+    """
+    Only used when save_mode='skim'; writes a thin clip to /dev/shm.
+    """
     if not frames_bgr:
         raise ValueError("No frames to write.")
     h, w = frames_bgr[0].shape[:2]
@@ -240,11 +253,11 @@ def write_frames_to_temp_video(frames_bgr: List[np.ndarray], fps: float, prefer_
     return path
 # -----------------------------------------------------------
 
-# ----------------- core batch logic -----------------
+# ----------------- Core batch logic -----------------
 def process_video(video_path: str, model, tokenizer, args) -> dict:
     t0 = time.monotonic()
 
-    # meta + sampling indices
+    # Meta + sampling indices
     fps, total = get_meta_opencv(video_path)
     gate_idxs = uniform_indices(total, args.gate_segments)
     desc_idxs = uniform_indices(total, args.desc_segments)
@@ -272,12 +285,12 @@ def process_video(video_path: str, model, tokenizer, args) -> dict:
         return {
             "video": video_path, "fall": False, "saved_path": "",
             "fps_est": float(fps), "qa_gate": [], "qa_desc": [],
-            "elapsed_gate": time.monotonic()-t_gate0, "elapsed_desc": 0.0
+            "elapsed_gate": time.monotonic() - t_gate0, "elapsed_desc": 0.0
         }
     t_gate1 = time.monotonic()
     fall_yes = is_fall_positive(qa_gate)
 
-    # ---------- Stage 2: description (+ save) ----------
+    # ---------- Stage 2: description (+ optional save) ----------
     t_desc0 = time.monotonic()
     if fall_yes:
         try:
@@ -292,7 +305,7 @@ def process_video(video_path: str, model, tokenizer, args) -> dict:
                 num_segments=len(desc_frames),
                 max_num=args.max_patches
             )
-            # save positive
+            # Save positives
             scenes_dir = os.path.join(args.alerts_dir, "scenes"); ensure_dir(scenes_dir)
             if args.save_mode == "copy":
                 base = f"fall_{now_str()}_{os.path.basename(video_path)}"
@@ -315,7 +328,7 @@ def process_video(video_path: str, model, tokenizer, args) -> dict:
             print(f"[ERROR] Desc/save failed for {os.path.basename(video_path)}: {e}")
     t_desc1 = time.monotonic()
 
-    # ---------- Logging positives ----------
+    # ---------- Log positives ----------
     if fall_yes:
         logs_dir = os.path.join(args.alerts_dir, "logs"); ensure_dir(logs_dir)
         rec = {
@@ -330,7 +343,7 @@ def process_video(video_path: str, model, tokenizer, args) -> dict:
             "desc_max_new_tokens": args.desc_max_new_tokens,
             "save_mode": args.save_mode,
             "save_container": args.save_container,
-            "qa": (qa_gate + [("-----","-----")] + qa_desc)
+            "qa": (qa_gate + [("-----", "-----")] + qa_desc)
         }
         jsonl = os.path.join(logs_dir, "vlm_results.jsonl")
         try:
@@ -342,7 +355,7 @@ def process_video(video_path: str, model, tokenizer, args) -> dict:
     # ---------- stdout summary ----------
     if fall_yes:
         print(f"\n=== FALL detected in {os.path.basename(video_path)} ===")
-        for q, a in (qa_gate + [("-----","-----")] + qa_desc):
+        for q, a in (qa_gate + [("-----", "-----")] + qa_desc):
             print(f"Q: {q}\nA: {a}\n")
         if saved_path:
             print(f"[SAVED] {saved_path}")
@@ -363,16 +376,18 @@ def process_video(video_path: str, model, tokenizer, args) -> dict:
 
 # ----------------- CLI -----------------
 def build_argparser():
-    p = argparse.ArgumentParser(description="Batch VLM evaluation over a video folder (OpenCV-only frames_direct).")
+    p = argparse.ArgumentParser(
+        description="Batch VLM evaluation over a video folder (OpenCV-only frames_direct, legacy API)."
+    )
     # IO
     p.add_argument("--input_dir", required=True, help="Directory containing video files")
     p.add_argument("--exts", default=".mp4,.avi,.mov,.mkv", help="Comma-separated extensions")
     p.add_argument("--recursive", action="store_true", help="Recurse into subfolders")
     p.add_argument("--limit", type=int, default=0, help="Process only first N videos (0=all)")
     p.add_argument("--alerts_dir", default="alerts", help="Base dir for scenes/ and logs/")
-    p.add_argument("--save_mode", default="copy", choices=["copy","skim","none"],
+    p.add_argument("--save_mode", default="copy", choices=["copy", "skim", "none"],
                    help="On positive: copy original, or save skim clip, or none")
-    p.add_argument("--save_container", default="avi", choices=["avi","mp4"],
+    p.add_argument("--save_container", default="avi", choices=["avi", "mp4"],
                    help="Container for skim clip")
     p.add_argument("--save_skim_fps", type=float, default=8.0, help="FPS for skim clip")
     # Model
@@ -387,11 +402,11 @@ def build_argparser():
     # Gating (Stage 1)
     p.add_argument("--gate_segments", type=int, default=1, help="Frames for gate (1=last frame only)")
     p.add_argument("--gate_max_new_tokens", type=int, default=2, help="Tokens for gate")
-    p.add_argument("--gate_do_sample", action="store_true", help="Sampling for gate")
+    p.add_argument("--gate_do_sample", action="store_true", help="Enable sampling for gate")
     # Description (Stage 2)
     p.add_argument("--desc_segments", type=int, default=3, help="Frames for description")
     p.add_argument("--desc_max_new_tokens", type=int, default=64, help="Tokens for description")
-    p.add_argument("--desc_do_sample", action="store_true", help="Sampling for description")
+    p.add_argument("--desc_do_sample", action="store_true", help="Enable sampling for description")
     # Misc
     p.add_argument("--verbose", action="store_true")
     return p
@@ -433,7 +448,7 @@ def main():
     if args.prewarm:
         print("[INFO] Warming up VLM...")
         try:
-            dummy = np.zeros((224,224,3), dtype=np.uint8)
+            dummy = np.zeros((224, 224, 3), dtype=np.uint8)
             _ = run_frames_inference(
                 model=model, tokenizer=tokenizer,
                 frames=[dummy],
